@@ -1,44 +1,44 @@
+// server.js
 const express = require('express');
-const fetch = require('node-fetch');
-const cheerio = require('cheerio');
 const WebSocket = require('ws');
+const puppeteer = require('puppeteer');
 
 const app = express();
 const HTTP_PORT = 3000;
 const WS_PORT = 3001;
 
+let latestOglasi = [];
+
 async function fetchOglase() {
-    const response = await fetch('https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?rows=30&PRICE_TO=15000&YEAR_MODEL_FROM=1990', {
-        headers: { "User-Agent": "Mozilla/5.0" }
+    const browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+    const page = await browser.newPage();
+    await page.goto('https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?PRICE_TO=15000&YEAR_MODEL_FROM=1990', {waitUntil: 'networkidle2'});
+
+    const oglasi = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('a[data-testid^="search-result-entry"]')).slice(0,5).map(el => {
+            const naslov = el.querySelector('h3')?.innerText.trim() || '';
+            const cijena = el.querySelector('span[data-testid^="search-result-entry-price"]')?.innerText.trim() || '';
+            const slika = el.querySelector('img')?.src || '';
+            const teaser = el.querySelectorAll('[data-testid*="teaser-attributes"] > div');
+            const godiste = teaser[0]?.querySelector('span')?.innerText.trim() || '';
+            const kilometraza = teaser[1]?.querySelector('span')?.innerText.trim() || '';
+            const opis = el.querySelector('div[data-testid="search-result-entry-description"]')?.innerText.trim() || '';
+            const telMatch = opis.match(/(\+43|0)[0-9][0-9\s/-]{5,}/);
+            const telefon = telMatch ? telMatch[0] : null;
+            const href = el.getAttribute('href');
+            const link = href ? `https://www.willhaben.at${href}` : '';
+            return { naslov, cijena, slika, godiste, kilometraza, opis, telefon, link };
+        });
     });
-    const html = await response.text();
-    const $ = cheerio.load(html);
 
-    const oglasi = [];
-    $('a[data-testid^="search-result-entry"]').slice(0,5).each((i, el) => {
-        const href = $(el).attr('href');
-        const link = href ? `https://www.willhaben.at${href}` : '';
-        const naslov = $(el).find('h3').text().trim();
-        const cijena = $(el).find('span[data-testid^="search-result-entry-price"]').text().trim();
-        const slika = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
-        const teaser = $(el).find('[data-testid*="teaser-attributes"] > div');
-        const godiste = teaser.eq(0).find('span').text().trim() || '';
-        const kilometraza = teaser.eq(1).find('span').text().trim() || '';
-
-        oglasi.push({ naslov, cijena, slika, godiste, kilometraza, link });
-    });
-
+    await browser.close();
     return oglasi;
 }
 
-// REST endpoint
+// REST endpoint (za test)
 app.get('/oglasi', async (req, res) => {
-    try {
-        const oglasi = await fetchOglase();
-        res.json(oglasi);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    const oglasi = await fetchOglase();
+    res.json(oglasi);
 });
 
 app.listen(HTTP_PORT, () => console.log(`HTTP server: http://localhost:${HTTP_PORT}`));
@@ -47,14 +47,23 @@ app.listen(HTTP_PORT, () => console.log(`HTTP server: http://localhost:${HTTP_PO
 const wss = new WebSocket.Server({ port: WS_PORT });
 console.log(`WebSocket server: ws://localhost:${WS_PORT}`);
 
-wss.on('connection', ws => {
-    console.log('Novi klijent povezan');
-
-    fetchOglase().then(data => ws.send(JSON.stringify(data)));
+wss.on('connection', async ws => {
+    console.log('Novi klijent');
+    
+    // Pošalji odmah latest
+    if (latestOglasi.length) ws.send(JSON.stringify(latestOglasi));
 
     const interval = setInterval(async () => {
-        const data = await fetchOglase();
-        if(ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+        try {
+            const oglasi = await fetchOglase();
+            // Ako ima novi oglas, pošalji update
+            if (JSON.stringify(oglasi) !== JSON.stringify(latestOglasi)) {
+                latestOglasi = oglasi;
+                ws.send(JSON.stringify(oglasi));
+            }
+        } catch(e) {
+            console.error(e);
+        }
     }, 5000);
 
     ws.on('close', () => clearInterval(interval));
